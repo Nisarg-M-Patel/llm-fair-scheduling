@@ -18,8 +18,11 @@ This lab focuses on implementing fair scheduling policies in Vidur based on the 
 - **`get_prefill_token_service_cost()`** (0.25 pts)
   - Calculate standard prefill token service cost as defined in VTC paper
   
-- **`get_decode_token_service_cost()`** (0.25 pts)
+- **`get_decode_token_service_cost()`** (0.125 pts)
   - Calculate standard decode token service cost as per VTC paper
+
+- **`_get_service_cost()`** (0.125 pts)
+  - Calculate total service cost of a request
 
 #### VTC Core Functions (7 points)
 Implement the following methods in `VTCReplicaScheduler`:
@@ -52,6 +55,9 @@ Implement the following methods in `VTCReplicaScheduler`:
 - **`_get_next_batch()`** (4.5 pts)
   - Manages batch creation and scheduling
   - Augment the mixed batching schedule from Sarathi with VTC. Combining VTC with chunking enables preemption and fair-scheduling at a chunk level.
+
+## Submission Guidelines
+Submit your completed `request.py`, `vtc_replica_scheduler.py`, and `vtc_sarathi_replica_scheduler.py` files.
 
 ## Resources
 
