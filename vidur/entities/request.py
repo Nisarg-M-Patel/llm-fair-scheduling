@@ -226,14 +226,15 @@ class Request(BaseEntity):
         Compute service cost for decode tokens using DECODE_SERVICE_COST_MULTIPLIER.
         Point 0.25
         """
-        return self._num_decode_tokens * DECODE_SERVICE_COST_MULTIPLIER
+        return DECODE_SERVICE_COST_MULTIPLIER
 
     def _get_service_cost(self) -> float:
         """
         Compute service cost for request.
         Points 0.0
         """
-        return self.get_prefill_token_service_cost(self._num_prefill_tokens) + self.get_decode_token_service_cost()
+        return (self.get_prefill_token_service_cost(self._num_prefill_tokens) +
+                 self.get_decode_token_service_cost() * self._num_decode_tokens)
 
     def on_batch_schedule(
         self,

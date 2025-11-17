@@ -44,7 +44,7 @@ class VTCReplicaScheduler(VLLMReplicaScheduler):
         Update virtual counters when batch complete processing.
         """
         client_service = {}
-        
+    
         for request, num_tokens in zip(batch.requests, batch.num_tokens):
             client_id = request.client_id
             
@@ -54,7 +54,7 @@ class VTCReplicaScheduler(VLLMReplicaScheduler):
             if not request.is_prefill_complete:
                 service_cost = request.get_prefill_token_service_cost(num_tokens)
             else:
-                service_cost = num_tokens * (request.get_decode_token_service_cost() / request.num_decode_tokens)
+                service_cost = num_tokens * request.get_decode_token_service_cost()
             
             client_service[client_id] += service_cost
         
