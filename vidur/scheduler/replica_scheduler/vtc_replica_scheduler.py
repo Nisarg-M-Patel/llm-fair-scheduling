@@ -51,10 +51,10 @@ class VTCReplicaScheduler(VLLMReplicaScheduler):
             if client_id not in client_service:
                 client_service[client_id] = 0.0
             
-            if not request.is_prefill_complete:
-                service_cost = request.get_prefill_token_service_cost(num_tokens)
-            else:
+            if request.has_started_decode:
                 service_cost = num_tokens * request.get_decode_token_service_cost()
+            else:
+                service_cost = request.get_prefill_token_service_cost(num_tokens)
             
             client_service[client_id] += service_cost
         
@@ -97,28 +97,38 @@ class VTCReplicaScheduler(VLLMReplicaScheduler):
         num_batch_tokens = 0
         
         while self._request_queue:
-            request, idx = self._select_next_request()
+            best_request = None
+            best_idx = None
+            best_counter = float('inf')
             
-            if request is None:
+            for idx, request in enumerate(self._request_queue):
+                if not self._can_allocate_request(request):
+                    continue
+                
+                next_num_tokens = self._get_request_next_num_tokens(request)
+                new_num_tokens = num_tokens + [next_num_tokens]
+                new_num_batch_tokens = len(new_num_tokens) * max(new_num_tokens)
+                
+                if new_num_batch_tokens > self._config.max_tokens_in_batch:
+                    continue
+                
+                if len(self._allocation_map) >= self._config.batch_size_cap:
+                    break  
+                
+                if len(requests) >= self._max_micro_batch_size:
+                    break
+                
+                counter = self._virtual_counters.get(request.client_id, 0.0)
+                if counter < best_counter:
+                    best_counter = counter
+                    best_request = request
+                    best_idx = idx
+            
+            if best_request is None:
                 break
             
-            next_num_tokens = self._get_request_next_num_tokens(request)
-            
-            if not self._can_allocate_request(request):
-                break
-            
-            new_num_tokens = num_tokens + [next_num_tokens]
-            new_num_batch_tokens = len(new_num_tokens) * max(new_num_tokens)
-            if new_num_batch_tokens > self._config.max_tokens_in_batch:
-                break
-            
-            if len(self._allocation_map) == self._config.batch_size_cap:
-                break
-            
-            if len(requests) == self._max_micro_batch_size:
-                break
-            
-            request = self._request_queue.pop(idx)
+            next_num_tokens = self._get_request_next_num_tokens(best_request)
+            request = self._request_queue.pop(best_idx)
             
             self._allocate_request(request)
             requests.append(request)
@@ -131,22 +141,27 @@ class VTCReplicaScheduler(VLLMReplicaScheduler):
         self._preempted_requests.sort(key=lambda r: r.arrived_at)
         
         while self._preempted_requests:
-            if len(requests) == self._max_micro_batch_size:
-                break
-            
-            min_counter = float('inf')
-            selected_idx = None
+            best_request = None
+            best_idx = None
+            best_counter = float('inf')
             
             for idx, request in enumerate(self._preempted_requests):
-                counter = self._virtual_counters.get(request.client_id, 0.0)
-                if counter < min_counter:
-                    min_counter = counter
-                    selected_idx = idx
-            
-            if selected_idx is None:
-                break
+                if len(requests) >= self._max_micro_batch_size:
+                    break
                 
-            request = self._preempted_requests.pop(selected_idx)
+                if not self._can_allocate_request(request):
+                    continue
+                
+                counter = self._virtual_counters.get(request.client_id, 0.0)
+                if counter < best_counter:
+                    best_counter = counter
+                    best_request = request
+                    best_idx = idx
+            
+            if best_request is None:
+                break
+            
+            request = self._preempted_requests.pop(best_idx)
             
             while not self._can_allocate_request(request):
                 if self._preempted_requests:
