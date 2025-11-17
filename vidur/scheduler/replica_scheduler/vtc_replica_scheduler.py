@@ -92,43 +92,39 @@ class VTCReplicaScheduler(VLLMReplicaScheduler):
         """
         Get next batch to schedule.
         """
+        self._request_queue.sort(key=lambda r: self._virtual_counters.get(r.client_id, 0.0))
+        
         requests = []
         num_tokens = []
         num_batch_tokens = 0
         
-        while self._request_queue:
-            best_request = None
-            best_idx = None
-            best_counter = float('inf')
+        skipped_indices = []
+        current_idx = 0
+        
+        while current_idx < len(self._request_queue):
+            request = self._request_queue[current_idx]
             
-            for idx, request in enumerate(self._request_queue):
-                if not self._can_allocate_request(request):
-                    continue
-                
-                next_num_tokens = self._get_request_next_num_tokens(request)
-                new_num_tokens = num_tokens + [next_num_tokens]
-                new_num_batch_tokens = len(new_num_tokens) * max(new_num_tokens)
-                
-                if new_num_batch_tokens > self._config.max_tokens_in_batch:
-                    continue
-                
-                if len(self._allocation_map) >= self._config.batch_size_cap:
-                    break  
-                
-                if len(requests) >= self._max_micro_batch_size:
-                    break
-                
-                counter = self._virtual_counters.get(request.client_id, 0.0)
-                if counter < best_counter:
-                    best_counter = counter
-                    best_request = request
-                    best_idx = idx
+            next_num_tokens = self._get_request_next_num_tokens(request)
             
-            if best_request is None:
-                break
+            can_add = True
             
-            next_num_tokens = self._get_request_next_num_tokens(best_request)
-            request = self._request_queue.pop(best_idx)
+            if not self._can_allocate_request(request):
+                current_idx += 1
+                continue  
+            
+            new_num_tokens = num_tokens + [next_num_tokens]
+            new_num_batch_tokens = len(new_num_tokens) * max(new_num_tokens)
+            if new_num_batch_tokens > self._config.max_tokens_in_batch:
+                current_idx += 1
+                continue  
+            
+            if len(self._allocation_map) == self._config.batch_size_cap:
+                break  
+            
+            if len(requests) == self._max_micro_batch_size:
+                break  
+            
+            request = self._request_queue.pop(current_idx)
             
             self._allocate_request(request)
             requests.append(request)
@@ -138,30 +134,20 @@ class VTCReplicaScheduler(VLLMReplicaScheduler):
         if requests:
             return Batch(self._replica_id, requests, num_tokens)
         
-        self._preempted_requests.sort(key=lambda r: r.arrived_at)
+        self._preempted_requests.sort(key=lambda r: self._virtual_counters.get(r.client_id, 0.0))
         
-        while self._preempted_requests:
-            best_request = None
-            best_idx = None
-            best_counter = float('inf')
-            
-            for idx, request in enumerate(self._preempted_requests):
-                if len(requests) >= self._max_micro_batch_size:
-                    break
-                
-                if not self._can_allocate_request(request):
-                    continue
-                
-                counter = self._virtual_counters.get(request.client_id, 0.0)
-                if counter < best_counter:
-                    best_counter = counter
-                    best_request = request
-                    best_idx = idx
-            
-            if best_request is None:
+        current_idx = 0
+        while current_idx < len(self._preempted_requests):
+            if len(requests) == self._max_micro_batch_size:
                 break
             
-            request = self._preempted_requests.pop(best_idx)
+            request = self._preempted_requests[current_idx]
+            
+            if not self._can_allocate_request(request):
+                current_idx += 1
+                continue
+            
+            request = self._preempted_requests.pop(current_idx)
             
             while not self._can_allocate_request(request):
                 if self._preempted_requests:
