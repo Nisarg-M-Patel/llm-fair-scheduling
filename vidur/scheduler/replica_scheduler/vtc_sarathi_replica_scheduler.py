@@ -1,4 +1,4 @@
-from typing import Dict, Optional, List
+from typing import Dict, Optional, List, Tuple
 from collections import defaultdict
 
 from vidur.entities.batch import Batch, Request
@@ -40,7 +40,7 @@ class VTCSarathiReplicaScheduler(SarathiReplicaScheduler):
         """
         raise NotImplementedError
 
-    def _select_next_request(self, running_prefills: List[Request]) -> List[Request, int, bool]:
+    def _select_next_request(self, running_prefills: List[Request]) -> Tuple[Request, int, bool]:
         """
         Select next request based on VTC algorithm.
         Return:

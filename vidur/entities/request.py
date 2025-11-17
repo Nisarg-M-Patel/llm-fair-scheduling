@@ -219,21 +219,21 @@ class Request(BaseEntity):
         Compute service cost for prefill tokens using PREFILL_SERVICE_COST_MULTIPLIER.
         Point 0.25
         """
-        raise NotImplementedError
+        return num_tokens * PREFILL_SERVICE_COST_MULTIPLIER
     
     def get_decode_token_service_cost(self) -> float:
         """
         Compute service cost for decode tokens using DECODE_SERVICE_COST_MULTIPLIER.
         Point 0.25
         """
-        raise NotImplementedError
+        return self._num_decode_tokens * DECODE_SERVICE_COST_MULTIPLIER
 
     def _get_service_cost(self) -> float:
         """
         Compute service cost for request.
         Points 0.0
         """
-        raise NotImplementedError
+        return self.get_prefill_token_service_cost(self._num_prefill_tokens) + self.get_decode_token_service_cost()
 
     def on_batch_schedule(
         self,
