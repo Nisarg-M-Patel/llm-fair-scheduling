@@ -92,62 +92,55 @@ class VTCReplicaScheduler(VLLMReplicaScheduler):
         """
         Get next batch to schedule.
         """
-        self._request_queue.sort(key=lambda r: self._virtual_counters.get(r.client_id, 0.0))
-        
         requests = []
         num_tokens = []
         num_batch_tokens = 0
         
-        skipped_indices = []
-        current_idx = 0
+        attempted_indices = set()
         
-        while current_idx < len(self._request_queue):
-            request = self._request_queue[current_idx]
+        while len(attempted_indices) < len(self._request_queue):
+            request, idx = self._select_next_request()
+            
+            if request is None or idx in attempted_indices:
+                break
+            
+            if len(self._allocation_map) == self._config.batch_size_cap:
+                break
+            
+            if len(requests) == self._max_micro_batch_size:
+                break
             
             next_num_tokens = self._get_request_next_num_tokens(request)
             
-            can_add = True
-            
             if not self._can_allocate_request(request):
-                current_idx += 1
+                attempted_indices.add(idx)
                 continue  
             
             new_num_tokens = num_tokens + [next_num_tokens]
             new_num_batch_tokens = len(new_num_tokens) * max(new_num_tokens)
             if new_num_batch_tokens > self._config.max_tokens_in_batch:
-                current_idx += 1
+                attempted_indices.add(idx)
                 continue  
             
-            if len(self._allocation_map) == self._config.batch_size_cap:
-                break  
-            
-            if len(requests) == self._max_micro_batch_size:
-                break  
-            
-            request = self._request_queue.pop(current_idx)
+            request = self._request_queue.pop(idx)
             
             self._allocate_request(request)
             requests.append(request)
             num_tokens.append(next_num_tokens)
             num_batch_tokens += next_num_tokens
+            
+            attempted_indices = set()
         
         if requests:
             return Batch(self._replica_id, requests, num_tokens)
         
-        self._preempted_requests.sort(key=lambda r: self._virtual_counters.get(r.client_id, 0.0))
+        self._preempted_requests.sort(key=lambda r: r.arrived_at)
         
-        current_idx = 0
-        while current_idx < len(self._preempted_requests):
+        while self._preempted_requests:
             if len(requests) == self._max_micro_batch_size:
                 break
             
-            request = self._preempted_requests[current_idx]
-            
-            if not self._can_allocate_request(request):
-                current_idx += 1
-                continue
-            
-            request = self._preempted_requests.pop(current_idx)
+            request = self._preempted_requests.pop(0) 
             
             while not self._can_allocate_request(request):
                 if self._preempted_requests:
