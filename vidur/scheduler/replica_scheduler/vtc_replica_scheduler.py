@@ -29,13 +29,12 @@ class VTCReplicaScheduler(VLLMReplicaScheduler):
         Update virtual counter when a new request arrives.
         """
         client_id = request.client_id
-    
+
         if client_id in self._virtual_counters:
             return
-        
+
         if self._virtual_counters:
-            min_counter = min(self._virtual_counters.values())
-            self._virtual_counters[client_id] = min_counter
+            self._virtual_counters[client_id] = min(self._virtual_counters.values())
         else:
             self._virtual_counters[client_id] = 0.0
 
@@ -43,26 +42,37 @@ class VTCReplicaScheduler(VLLMReplicaScheduler):
         """
         Update virtual counters when batch complete processing.
         """
-        client_service = {}
+        client_service = defaultdict(float)
 
         for request, num_tokens in zip(batch.requests, batch.num_tokens):
             client_id = request.client_id
-            
-            if client_id not in client_service:
-                client_service[client_id] = 0.0
-            
-            tokens_before_batch = request.num_processed_tokens - num_tokens
-            
-            if tokens_before_batch < request.num_prefill_tokens:
-                service_cost = request.get_prefill_token_service_cost(num_tokens)
-            else:
-                service_cost = num_tokens * request.get_decode_token_service_cost()
-            
-            client_service[client_id] += service_cost
-        
+
+            tokens_after = request.num_processed_tokens
+            tokens_before = tokens_after - num_tokens
+
+            prefill_tokens_remaining = max(request.num_prefill_tokens - tokens_before, 0)
+            prefill_tokens = min(prefill_tokens_remaining, num_tokens)
+            decode_tokens = num_tokens - prefill_tokens
+
+            service_cost = (
+                request.get_prefill_token_service_cost(prefill_tokens)
+                + request.get_decode_token_service_cost() * decode_tokens
+            )
+
+            damping = (
+                self._config.client_zero_damping
+                if client_id == 0
+                else self._config.client_one_damping
+            )
+
+            client_service[client_id] += service_cost / damping
+
         for client_id, service in client_service.items():
             self._virtual_counters[client_id] += service
-                
+
+        if batch.requests:
+            self._last_client_scheduled = batch.requests[-1].client_id
+
     def _select_next_request(self) -> Tuple[Request, int]:
         """
         Select next request based on VTC algorithm.
@@ -73,20 +83,21 @@ class VTCReplicaScheduler(VLLMReplicaScheduler):
         if not self._request_queue:
             return None, None
 
-        min_counter = float('inf')
-        selected_request = None
-        selected_index = None
-        
+        best_idx = None
+        best_key = None
+
         for idx, request in enumerate(self._request_queue):
-            client_id = request.client_id
-            counter = self._virtual_counters.get(client_id, 0.0)
-            
-            if counter < min_counter:
-                min_counter = counter
-                selected_request = request
-                selected_index = idx
-        
-        return selected_request, selected_index
+            counter = self._virtual_counters.get(request.client_id, 0.0)
+            key = (counter, request.arrived_at)
+
+            if best_key is None or key < best_key:
+                best_key = key
+                best_idx = idx
+
+        selected_request = self._request_queue[best_idx]
+        self._last_client_scheduled = selected_request.client_id
+
+        return selected_request, best_idx
 
     def _get_next_batch(self) -> Batch:
         """
@@ -95,75 +106,47 @@ class VTCReplicaScheduler(VLLMReplicaScheduler):
         requests = []
         num_tokens = []
         num_batch_tokens = 0
-        
-        if self._request_queue:
-            for idx, req in enumerate(self._request_queue[:20]):
-                counter = self._virtual_counters.get(req.client_id, 0.0)
-        
-        sorted_indices = sorted(
-            range(len(self._request_queue)), 
-            key=lambda i: self._virtual_counters.get(self._request_queue[i].client_id, 0.0)
-        )
-        
-        attempted = set()
-        
-        for queue_idx in sorted_indices:
-            if queue_idx >= len(self._request_queue):
-                continue
-                
-            request = self._request_queue[queue_idx]
-            
-            if request.id in attempted:
-                continue
-            attempted.add(request.id)
-            
+
+        while self._request_queue:
             if len(requests) == self._max_micro_batch_size:
                 break
-            
             if len(self._allocation_map) == self._config.batch_size_cap:
                 break
-            
+
+            request, idx = self._select_next_request()
+            if request is None:
+                break
+
             next_num_tokens = self._get_request_next_num_tokens(request)
-            
+
+            prospective_tokens = num_tokens + [next_num_tokens]
+            if prospective_tokens:
+                prospective_batch_tokens = len(prospective_tokens) * max(prospective_tokens)
+                if prospective_batch_tokens > self._config.max_tokens_in_batch:
+                    break
+
             if not self._can_allocate_request(request):
-                continue
-            
-            new_num_tokens = num_tokens + [next_num_tokens]
-            new_num_batch_tokens = len(new_num_tokens) * max(new_num_tokens)
-            if new_num_batch_tokens > self._config.max_tokens_in_batch:
-                continue
-            
-            current_idx = next(i for i, r in enumerate(self._request_queue) if r.id == request.id)
-            request = self._request_queue.pop(current_idx)
-                        
+                break
+
+            self._request_queue.pop(idx)
             self._allocate_request(request)
             requests.append(request)
             num_tokens.append(next_num_tokens)
             num_batch_tokens += next_num_tokens
-        
+
         if requests:
             return Batch(self._replica_id, requests, num_tokens)
-        
-        self._preempted_requests.sort(key=lambda r: r.arrived_at)
-        
+
+        self._preempted_requests.sort(
+            key=lambda r: (self._virtual_counters.get(r.client_id, 0.0), r.arrived_at)
+        )
+
         while self._preempted_requests:
             if len(requests) == self._max_micro_batch_size:
                 break
-            
-            min_counter = float('inf')
-            selected_idx = None
-            
-            for idx, request in enumerate(self._preempted_requests):
-                counter = self._virtual_counters.get(request.client_id, 0.0)
-                if counter < min_counter:
-                    min_counter = counter
-                    selected_idx = idx
-            
-            if selected_idx is None:
-                break
-                
-            request = self._preempted_requests.pop(selected_idx)
-            
+
+            request = self._preempted_requests.pop(0)
+
             while not self._can_allocate_request(request):
                 if self._preempted_requests:
                     victim_request = self._preempted_requests.pop(-1)
@@ -180,8 +163,8 @@ class VTCReplicaScheduler(VLLMReplicaScheduler):
                 next_num_tokens = self._get_request_next_num_tokens(request)
                 requests.append(request)
                 num_tokens.append(next_num_tokens)
-        
+
         if not requests:
             return None
-        
+
         return Batch(self._replica_id, requests, num_tokens)

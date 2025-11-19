@@ -10,10 +10,10 @@ class VTCSarathiReplicaScheduler(SarathiReplicaScheduler):
     VTC-based Sarathi scheduler that provides fairness guarantees at chunk level.
     Inherits chunked prefill logic from SarathiReplicaScheduler.
     """
-    
+
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
-        
+
         # VTC-specific attributes
         self._virtual_counters: Dict[int, float] = defaultdict(float)
         self._last_client_scheduled: Optional[int] = None
@@ -33,10 +33,10 @@ class VTCSarathiReplicaScheduler(SarathiReplicaScheduler):
         This can be identical to the standard VTC implementation.
         """
         client_id = request.client_id
-    
+
         if client_id in self._virtual_counters:
             return
-        
+
         if self._virtual_counters:
             min_counter = min(self._virtual_counters.values())
             self._virtual_counters[client_id] = min_counter
@@ -48,39 +48,35 @@ class VTCSarathiReplicaScheduler(SarathiReplicaScheduler):
         """
         Update virtual counters when batch complete processing.
         """
-        
-        client_service = {}
-        
+        client_service = defaultdict(float)
+
         for request, num_tokens in zip(batch.requests, batch.num_tokens):
             client_id = request.client_id
-            
-            if client_id not in client_service:
-                client_service[client_id] = 0.0
-            
-            tokens_before = request.num_processed_tokens - num_tokens
+
             tokens_after = request.num_processed_tokens
-            
-            prefill_tokens = 0
-            decode_tokens = 0
-            
-            if tokens_before < request.num_prefill_tokens:
-                prefill_end = min(request.num_prefill_tokens, tokens_after)
-                prefill_tokens = prefill_end - tokens_before
-                
-                if tokens_after > request.num_prefill_tokens:
-                    decode_tokens = tokens_after - request.num_prefill_tokens
-            else:
-                decode_tokens = num_tokens
-            
-            cost = (request.get_prefill_token_service_cost(prefill_tokens) + 
-                    request.get_decode_token_service_cost() * decode_tokens)
-            
-            client_service[client_id] += cost
-        
+            tokens_before = tokens_after - num_tokens
+
+            prefill_tokens_remaining = max(request.num_prefill_tokens - tokens_before, 0)
+            prefill_tokens = min(prefill_tokens_remaining, num_tokens)
+            decode_tokens = num_tokens - prefill_tokens
+
+            cost = (
+                request.get_prefill_token_service_cost(prefill_tokens)
+                + request.get_decode_token_service_cost() * decode_tokens
+            )
+
+            damping = (
+                self._config.client_zero_damping
+                if client_id == 0
+                else self._config.client_one_damping
+            )
+
+            client_service[client_id] += cost / damping
+
         for client_id, service in client_service.items():
             old_counter = self._virtual_counters.get(client_id, 0.0)
             self._virtual_counters[client_id] = old_counter + service
-        
+
 
     def _select_next_request(self, running_prefills: List[Request]) -> Tuple[Request, int, bool]:
         """
@@ -94,18 +90,20 @@ class VTCSarathiReplicaScheduler(SarathiReplicaScheduler):
 
         for idx, req in enumerate(running_prefills):
             counter = self._virtual_counters.get(req.client_id, 0.0)
-            candidates.append((counter, idx, req, True))
-        
+            candidates.append((counter, req.arrived_at, idx, req, True))
+
         for idx, req in enumerate(self._request_queue):
             counter = self._virtual_counters.get(req.client_id, 0.0)
-            candidates.append((counter, idx, req, False))
-        
+            candidates.append((counter, req.arrived_at, idx, req, False))
+
         if not candidates:
             return None, -1, False
-        
-        candidates.sort(key=lambda x: x[0])
-        _, idx, request, is_running = candidates[0]
-        
+
+        candidates.sort(key=lambda x: (x[0], x[1]))
+        _, _, idx, request, is_running = candidates[0]
+
+        self._last_client_scheduled = request.client_id
+
         return request, idx, is_running
 
     def _get_next_batch(self) -> Batch:
@@ -119,7 +117,6 @@ class VTCSarathiReplicaScheduler(SarathiReplicaScheduler):
         contains_prefill = False
         num_batch_tokens = 0
 
-        
         while self._preempted_requests:
             if len(requests) == self._max_micro_batch_size:
                 break
@@ -156,20 +153,17 @@ class VTCSarathiReplicaScheduler(SarathiReplicaScheduler):
                 requests.append(request)
                 num_tokens.append(next_num_tokens)
 
-
-        while running_prefills or self._request_queue:  
+        while running_prefills or self._request_queue:
             if len(self._allocation_map) == self._config.batch_size_cap:
                 break
             if len(requests) == self._max_micro_batch_size:
                 break
 
             request, idx, is_running = self._select_next_request(running_prefills)
-            
+
             if request is None:
                 break
 
-            counter = self._virtual_counters.get(request.client_id, 0.0)
-            
             if is_running:
                 running_prefills.pop(idx)
             else:
@@ -190,14 +184,15 @@ class VTCSarathiReplicaScheduler(SarathiReplicaScheduler):
             if not is_running:
                 self._allocate_request(request)
 
-            contains_prefill = True
+            contains_prefill = contains_prefill or not request.is_prefill_complete
             num_batch_tokens += next_num_tokens
             requests.append(request)
             num_tokens.append(next_num_tokens)
 
         self._preempted_requests = skipped_requests + running_prefills + self._preempted_requests
         self._preempted_requests = sorted(
-            self._preempted_requests, key=lambda req: req.arrived_at
+            self._preempted_requests,
+            key=lambda req: (self._virtual_counters.get(req.client_id, 0.0), req.arrived_at),
         )
 
         if not requests:
