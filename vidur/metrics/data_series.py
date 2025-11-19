@@ -321,8 +321,11 @@ class DataSeries:
         df[self._y_name] = df[self._y_name].cumsum()
 
         # subsample 1000 points
-        df = df.iloc[:: len(df) // 1000]
+        #df = df.iloc[:: len(df) // 1000]
+        step = max(1, len(df) // 1000)
+        df = df.iloc[:: step]
 
+        
         # Calculate differentials using pandas diff
         dx = df[self._x_name].diff()
         dy = df[self._y_name].diff()
