@@ -51,10 +51,10 @@ class VTCReplicaScheduler(VLLMReplicaScheduler):
             if client_id not in client_service:
                 client_service[client_id] = 0.0
             
-            if request.has_started_decode:
-                service_cost = num_tokens * request.get_decode_token_service_cost()
-            else:
+            if not request.is_prefill_complete:
                 service_cost = request.get_prefill_token_service_cost(num_tokens)
+            else:
+                service_cost = num_tokens * request.get_decode_token_service_cost()
             
             client_service[client_id] += service_cost
         
@@ -96,12 +96,20 @@ class VTCReplicaScheduler(VLLMReplicaScheduler):
         num_tokens = []
         num_batch_tokens = 0
         
-        attempted_indices = set()
-        
-        while len(attempted_indices) < len(self._request_queue):
+        while self._request_queue:
             request, idx = self._select_next_request()
             
-            if request is None or idx in attempted_indices:
+            if request is None:
+                break
+            
+            next_num_tokens = self._get_request_next_num_tokens(request)
+            
+            if not self._can_allocate_request(request):
+                break
+            
+            new_num_tokens = num_tokens + [next_num_tokens]
+            new_num_batch_tokens = len(new_num_tokens) * max(new_num_tokens)
+            if new_num_batch_tokens > self._config.max_tokens_in_batch:
                 break
             
             if len(self._allocation_map) == self._config.batch_size_cap:
@@ -110,26 +118,12 @@ class VTCReplicaScheduler(VLLMReplicaScheduler):
             if len(requests) == self._max_micro_batch_size:
                 break
             
-            next_num_tokens = self._get_request_next_num_tokens(request)
-            
-            if not self._can_allocate_request(request):
-                attempted_indices.add(idx)
-                continue  
-            
-            new_num_tokens = num_tokens + [next_num_tokens]
-            new_num_batch_tokens = len(new_num_tokens) * max(new_num_tokens)
-            if new_num_batch_tokens > self._config.max_tokens_in_batch:
-                attempted_indices.add(idx)
-                continue  
-            
             request = self._request_queue.pop(idx)
             
             self._allocate_request(request)
             requests.append(request)
             num_tokens.append(next_num_tokens)
             num_batch_tokens += next_num_tokens
-            
-            attempted_indices = set()
         
         if requests:
             return Batch(self._replica_id, requests, num_tokens)
@@ -140,7 +134,19 @@ class VTCReplicaScheduler(VLLMReplicaScheduler):
             if len(requests) == self._max_micro_batch_size:
                 break
             
-            request = self._preempted_requests.pop(0) 
+            min_counter = float('inf')
+            selected_idx = None
+            
+            for idx, request in enumerate(self._preempted_requests):
+                counter = self._virtual_counters.get(request.client_id, 0.0)
+                if counter < min_counter:
+                    min_counter = counter
+                    selected_idx = idx
+            
+            if selected_idx is None:
+                break
+                
+            request = self._preempted_requests.pop(selected_idx)
             
             while not self._can_allocate_request(request):
                 if self._preempted_requests:
